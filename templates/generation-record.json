@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "template_only": true,
+  "run_id": null,
+  "provider": null,
+  "model_version": null,
+  "source_hashes": [],
+  "reference_order": [],
+  "prompt_private_path": null,
+  "seed": null,
+  "settings": {},
+  "outputs": [],
+  "elapsed_seconds": null,
+  "billing_unit": null,
+  "actual_debit": null,
+  "paid_allocation": null,
+  "currency": null,
+  "native_dimensions": null,
+  "delivery_dimensions": null,
+  "retry_reason": null,
+  "acceptance": "pending"
+}

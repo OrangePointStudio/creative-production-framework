@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "fictional_example": true,
+  "product_id": "sample-object",
+  "message": "SYNTHETIC DEMO",
+  "claims": [],
+  "format": {"width": 512, "height": 512},
+  "demo_colour": "#607d8b"
+}

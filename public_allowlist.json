@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "files": [
+    ".gitattributes",
+    ".github/workflows/verify.yml",
+    ".gitignore",
+    "AGENTS.md",
+    "LICENSE",
+    "README.md",
+    "SECURITY.md",
+    "docs/architecture.md",
+    "docs/commercial-pilot.md",
+    "docs/cost-model.md",
+    "docs/installation-and-handover.md",
+    "docs/operator-guide.md",
+    "docs/privacy-and-publishing.md",
+    "docs/quality-gates.md",
+    "docs/reproducibility.md",
+    "public_allowlist.json",
+    "studioflow/__init__.py",
+    "studioflow/__main__.py",
+    "studioflow/cli.py",
+    "studioflow/core.py",
+    "templates/brief.json",
+    "templates/generation-record.json",
+    "tests/test_release.py",
+    "tests/test_workflow.py",
+    "tools/audit_release.py",
+    "tools/build_public_archive.py"
+  ]
+}
