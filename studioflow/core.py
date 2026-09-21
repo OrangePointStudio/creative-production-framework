@@ -2,15 +2,15 @@
 
 import csv
 import hashlib
-import io
 import json
+import os
 import re
 import shutil
 import stat
 import sys
 import zipfile
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, DecimalException
 from pathlib import Path
 
 VERSION = "0.1.0"
@@ -33,27 +33,53 @@ def dump(value):
 
 def read_json(path):
     try:
+        path = private_path(path)
         value = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(value, dict):
             raise ValueError("Expected an object")
         return value
-    except (ValueError, OSError) as exc:
+    except (ValueError, OSError, RecursionError) as exc:
         raise WorkflowError("Required JSON record is missing or invalid.") from exc
 
 
 def write_new(path, data):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("xb") as stream:
+    with open_private_new(path) as stream:
         stream.write(data)
+
+
+def make_private_dirs(path):
+    """Restrict newly created POSIX directories; existing ACLs remain external."""
+    path = private_path(path)
+    pending = []
+    current = path
+    while not current.exists():
+        pending.append(current)
+        current = current.parent
+    if not current.is_dir():
+        raise WorkflowError("Private directory parent is not a directory.")
+    for directory in reversed(pending):
+        private_path(directory).mkdir(mode=0o700)
+
+
+def open_private_new(path):
+    """Create exclusively with owner-only POSIX permissions from the first byte."""
+    path = private_path(path)
+    make_private_dirs(path.parent)
+    path = private_path(path)
+    flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+             | getattr(os, "O_BINARY", 0))
+    return os.fdopen(os.open(path, flags, 0o600), "wb")
 
 
 def has_link(path):
     """Reject symlinks and Windows reparse points in existing path components."""
     for part in (path, *path.parents):
-        if part.exists() or part.is_symlink():
+        try:
             info = part.lstat()
-            if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
-                return True
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+            return True
     return False
 
 
@@ -64,16 +90,19 @@ def private_path(value):
     path = path.resolve()
     if path == ENGINE_ROOT or ENGINE_ROOT in path.parents:
         raise WorkflowError("Use a private workspace outside the engine repository.")
-    if any((parent / ".git").exists() for parent in (path, *path.parents)):
+    if any((parent / ".git").exists() or (parent / ".git").is_symlink()
+           for parent in (path, *path.parents)):
         raise WorkflowError("Private production workspaces must be outside Git worktrees.")
     return path
 
 
 def workspace(value):
     root = private_path(value)
-    marker = read_json(root / "workspace.json")
-    if marker.get("schema_version") != 1:
+    marker = read_json(inside(root, "workspace.json"))
+    if type(marker.get("schema_version")) is not int or marker["schema_version"] != 1:
         raise WorkflowError("Unsupported workspace schema. Do not upgrade in place.")
+    if marker.get("lane") not in ("cloud", "hybrid", "local"):
+        raise WorkflowError("Workspace production lane is missing or invalid.")
     return root
 
 
@@ -84,13 +113,17 @@ def identifier(value):
 
 
 def inside(root, relative):
-    if not isinstance(relative, str) or not relative or "\\" in relative:
+    if not isinstance(relative, str) or not relative or "\\" in relative or "\x00" in relative:
         raise WorkflowError("Record paths must use nonempty relative POSIX paths.")
+    try:
+        relative.encode("utf-8")
+    except UnicodeError as exc:
+        raise WorkflowError("Record path contains invalid Unicode.") from exc
     path = Path(relative)
     if path.is_absolute() or ":" in relative or any(p in (".", "..") for p in relative.split("/")):
         raise WorkflowError("Unsafe record path.")
-    target = root / path
-    if has_link(target) or root not in target.resolve().parents:
+    target = private_path(root / path)
+    if root not in target.parents:
         raise WorkflowError("Record path escapes its private workspace.")
     return target
 
@@ -101,9 +134,10 @@ def initialize(value, lane="local"):
         raise WorkflowError("Unknown production lane.")
     if root.exists():
         raise WorkflowError("Workspace already exists. Existing files are never replaced.")
-    root.mkdir(parents=True)
+    make_private_dirs(root.parent)
+    private_path(root).mkdir(mode=0o700)
     for name in ("sources", "work/frozen", "outputs", "records", "approvals", "selections"):
-        (root / name).mkdir(parents=True)
+        make_private_dirs(inside(root, name))
     write_new(root / "workspace.json", dump({"schema_version": 1, "engine_version": VERSION,
         "lane": lane, "fictional_example": True, "network_enabled": False}))
     write_new(root / "brief.json", dump({"schema_version": 1, "fictional_example": True,
@@ -130,18 +164,18 @@ def svg_bytes(brief):
 def run_demo(value, run_id, replay_from=None):
     root = workspace(value)
     run_id = identifier(run_id)
-    targets = [root / f"outputs/{run_id}", root / f"records/{run_id}.json",
-        root / f"work/frozen/{run_id}.json", root / f"approvals/{run_id}.json",
-        root / f"selections/{run_id}.json"]
+    targets = [inside(root, path) for path in (f"outputs/{run_id}", f"records/{run_id}.json",
+        f"work/frozen/{run_id}.json", f"approvals/{run_id}.json",
+        f"selections/{run_id}.json")]
     if any(p.exists() for p in targets):
         raise WorkflowError("Run identifier already exists. Choose a new revision.")
     if replay_from:
         previous = verify(value, identifier(replay_from))
-        frozen = root / f"work/frozen/{replay_from}.json"
+        frozen = inside(root, previous["frozen_source"]["path"])
         brief = read_json(frozen)
         expected = previous["outputs"][0]["sha256"]
     else:
-        brief = read_json(root / "brief.json")
+        brief = read_json(inside(root, "brief.json"))
         expected = None
     image = svg_bytes(brief)
     if expected and digest(image) != expected:
@@ -150,7 +184,7 @@ def run_demo(value, run_id, replay_from=None):
     output = {"path": f"outputs/{run_id}/demo.svg", "sha256": digest(image),
         "bytes": len(image), "kind": "synthetic_demo"}
     receipt = {"schema_version": 1, "run_id": run_id, "engine_version": VERSION,
-        "renderer": "synthetic-svg-v1", "lane": read_json(root / "workspace.json")["lane"],
+        "renderer": "synthetic-svg-v1", "lane": read_json(inside(root, "workspace.json")).get("lane"),
         "created_utc": datetime.now(timezone.utc).isoformat(), "outputs": [output],
         "frozen_source": {"path": f"work/frozen/{run_id}.json", "sha256": digest(frozen_bytes)},
         "replay_from": replay_from, "provider_calls": 0, "generation_cost": None,
@@ -169,17 +203,33 @@ def run_demo(value, run_id, replay_from=None):
 
 def verify(value, run_id):
     root = workspace(value)
-    record = read_json(root / f"records/{identifier(run_id)}.json")
-    if record.get("schema_version") != 1 or record.get("run_id") != run_id:
+    record = read_json(inside(root, f"records/{identifier(run_id)}.json"))
+    if type(record.get("schema_version")) is not int or record["schema_version"] != 1 or record.get("run_id") != run_id:
         raise WorkflowError("Run receipt schema or identity mismatch.")
     outputs = record.get("outputs")
     if not isinstance(outputs, list) or not outputs:
         raise WorkflowError("Run receipt has no outputs.")
-    for item in [*outputs, record.get("frozen_source", {})]:
+    frozen = record.get("frozen_source")
+    if not isinstance(frozen, dict) or frozen.get("path") != f"work/frozen/{run_id}.json":
+        raise WorkflowError("Invalid frozen source record.")
+    seen = set()
+    for item in [*outputs, frozen]:
         if not isinstance(item, dict):
             raise WorkflowError("Invalid run receipt item.")
         path = inside(root, item.get("path"))
-        if not path.is_file() or digest(path.read_bytes()) != item.get("sha256"):
+        fingerprint = item.get("sha256")
+        if not isinstance(fingerprint, str) or not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+            raise WorkflowError("Invalid run receipt hash.")
+        if item is not frozen:
+            if not item["path"].startswith(f"outputs/{run_id}/") or item["path"] in seen:
+                raise WorkflowError("Run outputs must use unique paths belonging to this run.")
+            seen.add(item["path"])
+            if type(item.get("bytes")) is not int or item["bytes"] < 0:
+                raise WorkflowError("Invalid output byte count.")
+        if not path.is_file():
+            raise WorkflowError("Run content changed or is missing. Approval is no longer valid.")
+        data = path.read_bytes()
+        if digest(data) != fingerprint or (item is not frozen and len(data) != item["bytes"]):
             raise WorkflowError("Run content changed or is missing. Approval is no longer valid.")
     return record
 
@@ -192,19 +242,23 @@ def selection_hash(outputs):
 def export_selection(value, run_id, destination, delivery=False):
     root = workspace(value)
     record = verify(value, run_id)
-    chosen = read_json(root / f"selections/{run_id}.json")
+    chosen = read_json(inside(root, f"selections/{run_id}.json"))
     paths = chosen.get("paths")
-    if chosen.get("schema_version") != 1 or chosen.get("run_id") != run_id:
+    if type(chosen.get("schema_version")) is not int or chosen["schema_version"] != 1 or chosen.get("run_id") != run_id:
         raise WorkflowError("Invalid selection record.")
     if not isinstance(paths, list) or not paths or any(not isinstance(p, str) for p in paths) or len(paths) != len(set(paths)):
         raise WorkflowError("Selection must contain unique explicit output paths.")
     permitted = {x["path"]: x for x in record["outputs"]}
     if any(p not in permitted or not p.startswith(f"outputs/{run_id}/") for p in paths):
         raise WorkflowError("Only explicitly selected outputs from this run can be exported.")
-    selected = [permitted[p] for p in paths]
+    # Private adapter receipts may contain arbitrary metadata. Export only this
+    # public schema, never the original receipt dictionaries.
+    selected = [{key: permitted[p][key] for key in ("path", "sha256", "bytes")} for p in paths]
     fingerprint = selection_hash(selected)
     if delivery:
-        approval = read_json(root / f"approvals/{run_id}.json")
+        approval = read_json(inside(root, f"approvals/{run_id}.json"))
+        if type(approval.get("schema_version")) is not int or approval["schema_version"] != 1:
+            raise WorkflowError("Invalid approval schema.")
         if approval.get("selection_sha256") != fingerprint:
             raise WorkflowError("Approval does not match the exact selected assets.")
         gates = approval.get("gates")
@@ -214,35 +268,44 @@ def export_selection(value, run_id, destination, delivery=False):
             item = gates.get(gate, {})
             if not isinstance(item, dict):
                 raise WorkflowError("Invalid approval gate.")
-            if item.get("status") != "approved" or not item.get("reviewer_role") or not item.get("recorded_at"):
+            if item.get("status") != "approved" or any(not isinstance(item.get(key), str)
+                    or not item[key].strip() for key in ("reviewer_role", "recorded_at")):
                 raise WorkflowError("Delivery requires all four recorded approval gates.")
     output = private_path(destination)
     if output.exists() or output.suffix.lower() != ".zip":
         raise WorkflowError("Choose a new ZIP path outside Git worktrees.")
-    output.parent.mkdir(parents=True, exist_ok=True)
     metadata = {"schema_version": 1, "audience": "delivery" if delivery else "review",
         "selection_sha256": fingerprint, "files": selected,
         "publication": "Export does not publish media or grant third-party rights."}
-    with zipfile.ZipFile(output, "x", compression=zipfile.ZIP_DEFLATED) as archive:
-        for item in selected:
-            data = inside(root, item["path"]).read_bytes()
-            if digest(data) != item["sha256"]:
-                raise WorkflowError("Output changed during export. Discard the incomplete ZIP.")
-            archive.writestr(item["path"], data)
-        archive.writestr("MANIFEST.json", dump(metadata))
-    with zipfile.ZipFile(output) as archive:
+    with open_private_new(output) as stream:
+        with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for item in selected:
+                data = inside(root, item["path"]).read_bytes()
+                if digest(data) != item["sha256"]:
+                    raise WorkflowError("Output changed during export. Discard the incomplete ZIP.")
+                archive.writestr(item["path"], data)
+            archive.writestr("MANIFEST.json", dump(metadata))
+    with zipfile.ZipFile(private_path(output)) as archive:
         if archive.testzip() is not None:
             raise WorkflowError("Export integrity verification failed.")
     return {"status": "exported", "audience": metadata["audience"], "files": len(selected),
-        "sha256": digest(output.read_bytes()), "selection_sha256": fingerprint}
+        "sha256": digest(private_path(output).read_bytes()), "selection_sha256": fingerprint}
 
 
 def summarize_costs(value):
     root = workspace(value)
     try:
-        rows = list(csv.DictReader((root / "records/costs.csv").read_text(encoding="utf-8").splitlines()))
+        ledger = csv.DictReader(inside(root, "records/costs.csv").read_text(encoding="utf-8").splitlines())
+        fields = ("provider", "unit", "quantity", "currency", "paid_amount", "phase")
+        if not ledger.fieldnames or any(field not in ledger.fieldnames for field in fields):
+            raise WorkflowError("Invalid cost ledger columns.")
+        rows = list(ledger)
         quantities, amounts, unknown = {}, {}, 0
         for row in rows:
+            if None in row or any(not isinstance(row.get(field), str) for field in fields):
+                raise WorkflowError("Invalid cost ledger row.")
+            if not row["provider"] or not row["unit"]:
+                raise WorkflowError("Cost provider and unit are required.")
             if row["phase"] not in ("setup", "production", "revision"):
                 raise WorkflowError("Unknown cost phase.")
             number = Decimal(row["quantity"])
@@ -257,7 +320,7 @@ def summarize_costs(value):
             if not money.is_finite() or money < 0 or not re.fullmatch(r"[A-Z]{3}", row["currency"]):
                 raise WorkflowError("Invalid paid allocation or currency.")
             amounts[row["currency"]] = amounts.get(row["currency"], Decimal(0)) + money
-    except (KeyError, InvalidOperation, OSError) as exc:
+    except (KeyError, DecimalException, OSError, UnicodeError, csv.Error) as exc:
         raise WorkflowError("Invalid cost ledger.") from exc
     return {"quantities_by_provider_and_unit": {k: str(v) for k, v in quantities.items()},
         "recorded_allocations_by_currency": {k: str(v) for k, v in amounts.items()},
