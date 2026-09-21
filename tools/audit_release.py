@@ -20,7 +20,7 @@ RULES = {
     "personal_home_path": r"(?:[A-Za-z]:[\\/](?:Users|Documents and Settings)[\\/][^\s]+|/(?:Users|home)/[^\s/]+/)",
     "private_cloud_url": r"https?://(?:drive\.google\.com|docs\.google\.com|mail\.google\.com|[^/]+\.blob\.core\.windows\.net)/[^\s]+",
     "credential_url": r"https?://[^\s\"'<>]+[?&](?:token|key|sig|signature|credential|X-Amz-Credential)=[^\s]+",
-    "credential_assignment": r"(?i)\b(?:api_key|access_token|client_secret|password)\s*[:=]\s*['\"][A-Za-z0-9_./+=-]{16,}['\"]",
+    "credential_assignment": r"(?i)(?<!\w)['\"]?(?:api_key|access_token|client_secret|password)['\"]?\s*[:=]\s*(?:['\"][^'\"\r\n]{16,}['\"]|[A-Za-z0-9_./+=-]{16,}(?=$|[\s,;#}\]]))",
     "encoded_payload": r"[A-Za-z0-9+/]{160,}={0,2}",
     "long_account_number": r"(?<![\w])\d{13,19}(?![\w])",
     "git_lfs_pointer": r"(?m)^version https://git-lfs[.]github[.]com/spec/v1$",
@@ -28,6 +28,9 @@ RULES = {
 EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 SAFE_EMAILS = {"maintainers@users.noreply.github.com"}
 PERMITTED_EXTENSIONS = {".py", ".md", ".json", ".toml", ".yml", ".yaml", ".txt"}
+COMMIT_IDENTITY = re.compile(r"(?P<role>author|committer) (?P<name>[^<>\r\n]+) <(?P<email>[^<>\r\n]+)> [0-9]+ [+-][0-9]{4}")
+PUBLIC_NOREPLY = re.compile(r"(?:[0-9]+\+)?[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}@users\.noreply\.github\.com")
+GITHUB_COMMITTER_EMAIL = "noreply" + "@github.com"
 
 
 def git(root, *args, optional=False):
@@ -37,7 +40,7 @@ def git(root, *args, optional=False):
     return result.stdout
 
 
-def scan_text(data, label, private_terms=()):
+def _scan_text(data, label, private_terms=(), *, public_identity_spans=()):
     issues = []
     if len(data) > 512 * 1024:
         return [{"file": label, "rule": "oversized_public_text"}]
@@ -52,6 +55,8 @@ def scan_text(data, label, private_terms=()):
             issues.append({"file": label, "line": text.count("\n", 0, match.start()) + 1, "rule": name})
     for match in EMAIL.finditer(text):
         value = match.group()
+        if match.span() in public_identity_spans:
+            continue
         if value not in SAFE_EMAILS and not value.endswith(("@example.com", "@example.invalid")):
             issues.append({"file": label, "line": text.count("\n", 0, match.start()) + 1, "rule": "email_address"})
     folded = text.casefold()
@@ -59,6 +64,46 @@ def scan_text(data, label, private_terms=()):
         if term.casefold() in folded:
             issues.append({"file": label, "rule": "private_vocabulary"})
     return issues
+
+
+def safe_label(label, private_terms=()):
+    """Keep locations useful without copying sensitive path text into reports."""
+    if _scan_text(label.encode("utf-8"), "path", private_terms):
+        return "[redacted-path]"
+    return label
+
+
+def scan_text(data, label, private_terms=()):
+    return _scan_text(data, safe_label(label, private_terms), private_terms)
+
+
+def scan_commit(data, label, private_terms=()):
+    """Recognize public GitHub identities only in actual Git identity headers.
+
+    This is a format exception, not identity authentication. Every other rule
+    scans the original bytes, including private vocabulary within public aliases.
+    """
+    spans = set()
+    if len(data) <= 512 * 1024:
+        try:
+            text = data.decode("utf-8")
+        except UnicodeError:
+            return scan_text(data, label, private_terms)
+        headers, separator, _ = text.partition("\n\n")
+        if separator:
+            offset = 0
+            for line in headers.split("\n"):
+                identity = COMMIT_IDENTITY.fullmatch(line)
+                if identity:
+                    email = identity.group("email")
+                    public_alias = PUBLIC_NOREPLY.fullmatch(email)
+                    github_service = (identity.group("role") == "committer" and
+                        identity.group("name") == "GitHub" and email == GITHUB_COMMITTER_EMAIL)
+                    if public_alias or github_service:
+                        start, end = identity.span("email")
+                        spans.add((offset + start, offset + end))
+                offset += len(line) + 1
+    return _scan_text(data, safe_label(label, private_terms), private_terms, public_identity_spans=spans)
 
 
 def audit(root, private_rules=None, history=True, require_clean=False):
@@ -69,6 +114,8 @@ def audit(root, private_rules=None, history=True, require_clean=False):
             raise ValueError("Linked repository path is not permitted.")
     root = candidate.resolve()
     allow = json.loads((root / "public_allowlist.json").read_text(encoding="utf-8"))
+    if not isinstance(allow, dict):
+        raise ValueError("Allowlist must be a JSON object.")
     names = allow.get("files", [])
     if not isinstance(names, list) or not names or any(not isinstance(n, str) for n in names) or len(names) != len(set(names)):
         raise ValueError("Allowlist must contain unique exact file names.")
@@ -81,14 +128,20 @@ def audit(root, private_rules=None, history=True, require_clean=False):
         if root == rules_path or root in rules_path.parents:
             raise ValueError("Private scan rules must remain outside the public repository.")
         rules = json.loads(rules_path.read_text(encoding="utf-8"))
+        if not isinstance(rules, dict):
+            raise ValueError("Private scan rules must be a JSON object.")
         terms = rules.get("terms", [])
-        if any(not isinstance(t, str) or len(t) < 3 for t in terms):
-            raise ValueError("Private vocabulary entries must be strings of at least three characters.")
-        forbidden_hashes = set(rules.get("forbidden_sha256", []))
+        if not isinstance(terms, list) or any(not isinstance(t, str) or len(t) < 3 for t in terms):
+            raise ValueError("Private vocabulary must be a list of strings of at least three characters.")
+        hashes = rules.get("forbidden_sha256", [])
+        if not isinstance(hashes, list) or any(not isinstance(h, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", h) for h in hashes):
+            raise ValueError("Private source hashes must be a list of SHA-256 digests.")
+        forbidden_hashes = {h.lower() for h in hashes}
     issues, files, seen = [], [], set()
 
-    def inspect(data, name):
-        issues.extend(scan_text(data, name, terms))
+    def inspect(data, name, *, commit=False):
+        scan = scan_commit if commit else scan_text
+        issues.extend(scan(data, name, terms))
         if hashlib.sha256(data).hexdigest() in forbidden_hashes:
             issues.append({"file": name, "rule": "private_source_hash"})
         issues.extend(scan_text(name.encode(), "path", terms))
@@ -136,10 +189,17 @@ def audit(root, private_rules=None, history=True, require_clean=False):
             issues.append({"file": name, "rule": "unapproved_index_entry"})
         if mode in ("100644", "100755"):
             inspect(git(root, "cat-file", "blob", oid), "index:" + name)
-    commits = git(root, "rev-list", "--all").decode().splitlines() if history else []
+    commits = []
+    if history:
+        shallow = git(root, "rev-parse", "--is-shallow-repository").strip()
+        if shallow == b"true":
+            issues.append({"rule": "shallow_history"})
+        elif shallow != b"false":
+            raise ValueError("Unable to verify complete Git history.")
+        commits = git(root, "rev-list", "--all").decode().splitlines()
     seen_blobs = set()
     for commit in commits:
-        inspect(git(root, "cat-file", "-p", commit), "commit:" + commit)
+        inspect(git(root, "cat-file", "-p", commit), "commit:" + commit, commit=True)
         for entry in git(root, "ls-tree", "-r", "-z", commit).split(b"\0"):
             if not entry:
                 continue
@@ -156,7 +216,10 @@ def audit(root, private_rules=None, history=True, require_clean=False):
     # This initial-release tool intentionally requires a simple, untagged history.
     if history and git(root, "tag", "--list").strip():
         issues.append({"rule": "tags_require_separate_release_review"})
-    return {"status": "PASS" if not issues else "BLOCKED", "files": sorted(files, key=lambda x: x["path"]),
+    # Only a passing audit produces an archive manifest. All other locations,
+    # including early allowlist/link errors, pass through the same redaction.
+    issues = [{**issue, "file": safe_label(issue["file"], terms)} if "file" in issue else issue for issue in issues]
+    return {"status": "PASS" if not issues else "BLOCKED", "files": [] if issues else sorted(files, key=lambda x: x["path"]),
         "commits_scanned": len(commits), "private_rules_applied": bool(private_rules), "issues": issues,
         "limits": "Heuristic scan plus exact allowlist; human review remains required."}
 

@@ -18,21 +18,23 @@ python -m studioflow export C:/CreativePrivate/demo --run first --output C:/Crea
 python -m studioflow costs C:/CreativePrivate/demo
 ```
 
-On macOS/Linux, substitute `python3` and a writable private path such as `/tmp/creative-private/demo`. Existing workspaces, run IDs and ZIP files are never overwritten. The demo produces a neutral square, not a customer product. It renders 512 by 512 regardless of any production format plans.
+On Linux, substitute `python3` and a writable private path such as `/tmp/creative-private/demo`. On macOS, use a physical path such as `/private/tmp/creative-private/demo`; the usual `/tmp` alias is a symlink and is rejected. Temporary directories are suitable only for this synthetic demo; use durable private storage for production. Existing workspaces, run IDs and ZIP files are never overwritten. The demo produces a neutral square, not a customer product. It renders 512 by 512 regardless of any production format plans.
 
 ## What is implemented
 
 | Capability | Reference implementation |
 | --- | --- |
-| Private workspace | Rejects locations inside Git and linked path components |
+| Private workspace | Checks concrete input/output paths for links and Git worktrees; creates owner-only files on POSIX |
 | Traceability | Frozen input, SHA-256 receipt, explicit run and selection records |
 | Replay | Identical synthetic output from verified frozen input |
 | Acceptance | Technical, creative, rights and client gates bound to selected asset hashes |
-| Export | Selected outputs and manifest only; separate review and delivery modes |
+| Export | Selected outputs and an allowlisted manifest; separate review and delivery modes |
 | Cost ledger | Provider units and currencies remain separate; missing cost is never zero |
 | Publication checks | Exact file allowlist, text and history scan, private deny rules, clean release archive |
 
 The `cloud`, `hybrid` and `local` lane values record intent. The included renderer remains offline in all three lanes. No external model is silently substituted. Human approval records are editable local evidence, not cryptographic identity signatures.
+
+Use an access-controlled parent directory. Newly created private directories use mode `0700` and files use `0600` on POSIX. Existing permissions and Windows ACLs must be configured by the operator. This CLI is not a sandbox against another process that can concurrently modify the workspace.
 
 ## Use the guides
 
