@@ -13,3 +13,5 @@ Private workspace checks reject linked paths and Git worktrees before file opera
 Delivery manifests contain only selected asset paths, hashes and byte counts. Keep adapter prompts, account identifiers, provider responses and internal costs in private records. Local approval JSON is editable evidence, not authenticated authorization.
 
 History-enabled release checks require a complete clone. Pattern detection covers common credential assignments, including quoted JSON keys and unquoted YAML values, but does not validate every secret format. Sensitive path labels are masked and blocked audits omit the file manifest. Keep private vocabulary rules current and review diagnostics before sharing them.
+
+Commit author and committer headers may use GitHub's public no-reply aliases or its service no-reply address. This narrow metadata exception does not apply to file contents, filenames or commit messages. Private vocabulary and all other detectors still inspect the original headers; a no-reply alias is not an identity signature or proof of authorization.

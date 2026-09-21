@@ -27,6 +27,8 @@ Review source and commit metadata manually as well. Stage only exact reviewed pa
 
 CI uses read-only repository permission, pinned actions, synthetic temporary data and no provider secrets. Do not upload customer files as Actions artifacts or use pull-request workflows with privileged credentials. GitHub platform activity can identify the authenticated publisher even when commit metadata is neutral; a source scan cannot anonymize a hosting account.
 
+The email detector permits GitHub's public no-reply identity formats only in complete author/committer headers, including GitHub-generated merge commits. Other email addresses remain subject to the normal scan rules, and no such exception exists in filenames, file contents or commit messages. Private vocabulary and other secret detectors still inspect the unmodified metadata. This supports ordinary GitHub pull requests without treating a public no-reply alias as a private contact address.
+
 Protect the default branch in GitHub settings: require a pull request, require the `test (ubuntu-latest)` and `test (windows-latest)` checks on an up-to-date branch, and block force pushes and deletion. Apply the protections to administrators as well. These hosting settings must be verified separately; a committed workflow does not activate branch protection. Review secret scanning and push protection in the repository's security settings. A CI failure after a public push cannot undo disclosure.
 
 This guard reduces accidental disclosure. It is not a complete DLP service and does not establish a mathematical absence of sensitive data. Public release requires deliberate review every time.

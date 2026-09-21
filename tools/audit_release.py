@@ -28,6 +28,9 @@ RULES = {
 EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 SAFE_EMAILS = {"maintainers@users.noreply.github.com"}
 PERMITTED_EXTENSIONS = {".py", ".md", ".json", ".toml", ".yml", ".yaml", ".txt"}
+COMMIT_IDENTITY = re.compile(r"(?P<role>author|committer) (?P<name>[^<>\r\n]+) <(?P<email>[^<>\r\n]+)> [0-9]+ [+-][0-9]{4}")
+PUBLIC_NOREPLY = re.compile(r"(?:[0-9]+\+)?[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}@users\.noreply\.github\.com")
+GITHUB_COMMITTER_EMAIL = "noreply" + "@github.com"
 
 
 def git(root, *args, optional=False):
@@ -37,7 +40,7 @@ def git(root, *args, optional=False):
     return result.stdout
 
 
-def _scan_text(data, label, private_terms=()):
+def _scan_text(data, label, private_terms=(), *, public_identity_spans=()):
     issues = []
     if len(data) > 512 * 1024:
         return [{"file": label, "rule": "oversized_public_text"}]
@@ -52,6 +55,8 @@ def _scan_text(data, label, private_terms=()):
             issues.append({"file": label, "line": text.count("\n", 0, match.start()) + 1, "rule": name})
     for match in EMAIL.finditer(text):
         value = match.group()
+        if match.span() in public_identity_spans:
+            continue
         if value not in SAFE_EMAILS and not value.endswith(("@example.com", "@example.invalid")):
             issues.append({"file": label, "line": text.count("\n", 0, match.start()) + 1, "rule": "email_address"})
     folded = text.casefold()
@@ -70,6 +75,35 @@ def safe_label(label, private_terms=()):
 
 def scan_text(data, label, private_terms=()):
     return _scan_text(data, safe_label(label, private_terms), private_terms)
+
+
+def scan_commit(data, label, private_terms=()):
+    """Recognize public GitHub identities only in actual Git identity headers.
+
+    This is a format exception, not identity authentication. Every other rule
+    scans the original bytes, including private vocabulary within public aliases.
+    """
+    spans = set()
+    if len(data) <= 512 * 1024:
+        try:
+            text = data.decode("utf-8")
+        except UnicodeError:
+            return scan_text(data, label, private_terms)
+        headers, separator, _ = text.partition("\n\n")
+        if separator:
+            offset = 0
+            for line in headers.split("\n"):
+                identity = COMMIT_IDENTITY.fullmatch(line)
+                if identity:
+                    email = identity.group("email")
+                    public_alias = PUBLIC_NOREPLY.fullmatch(email)
+                    github_service = (identity.group("role") == "committer" and
+                        identity.group("name") == "GitHub" and email == GITHUB_COMMITTER_EMAIL)
+                    if public_alias or github_service:
+                        start, end = identity.span("email")
+                        spans.add((offset + start, offset + end))
+                offset += len(line) + 1
+    return _scan_text(data, safe_label(label, private_terms), private_terms, public_identity_spans=spans)
 
 
 def audit(root, private_rules=None, history=True, require_clean=False):
@@ -105,8 +139,9 @@ def audit(root, private_rules=None, history=True, require_clean=False):
         forbidden_hashes = {h.lower() for h in hashes}
     issues, files, seen = [], [], set()
 
-    def inspect(data, name):
-        issues.extend(scan_text(data, name, terms))
+    def inspect(data, name, *, commit=False):
+        scan = scan_commit if commit else scan_text
+        issues.extend(scan(data, name, terms))
         if hashlib.sha256(data).hexdigest() in forbidden_hashes:
             issues.append({"file": name, "rule": "private_source_hash"})
         issues.extend(scan_text(name.encode(), "path", terms))
@@ -164,7 +199,7 @@ def audit(root, private_rules=None, history=True, require_clean=False):
         commits = git(root, "rev-list", "--all").decode().splitlines()
     seen_blobs = set()
     for commit in commits:
-        inspect(git(root, "cat-file", "-p", commit), "commit:" + commit)
+        inspect(git(root, "cat-file", "-p", commit), "commit:" + commit, commit=True)
         for entry in git(root, "ls-tree", "-r", "-z", commit).split(b"\0"):
             if not entry:
                 continue

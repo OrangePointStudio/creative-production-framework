@@ -28,10 +28,99 @@ class ReleaseTests(unittest.TestCase):
     def git(self, *args):
         return subprocess.run(["git", "-C", str(self.root), *args], check=True, capture_output=True)
 
+    @staticmethod
+    def commit_fixture(author_email, *, committer_email=None, author_name="Synthetic Author",
+            committer_name="Synthetic Committer", message="Synthetic commit", extra_headers=""):
+        committer_email = committer_email or "maintainers@users.noreply.github.com"
+        return ("tree " + "0" * 40 + "\n" +
+            f"author {author_name} <{author_email}> 1700000000 +0000\n" +
+            f"committer {committer_name} <{committer_email}> 1700000000 +0000\n" +
+            extra_headers + "\n" + message + "\n").encode()
+
     def test_neutral_repository_passes(self):
         result = scanner.audit(self.root)
         self.assertEqual(result["status"], "PASS")
         self.assertEqual([entry["path"] for entry in result["files"]], ["README.md", "public_allowlist.json"])
+
+    def test_public_github_aliases_pass_only_in_commit_identity_headers(self):
+        domain = "@users.noreply.github.com"
+        for username in ("synthetic-public", "12345+synthetic-public"):
+            email = username + domain
+            data = self.commit_fixture(email, committer_email=email)
+            self.assertEqual(scanner.scan_commit(data, "commit:fixture"), [])
+            self.assertIn("email_address", [x["rule"] for x in scanner.scan_text(data, "blob")])
+        self.git("config", "user.email", "12345+synthetic-public" + domain)
+        self.git("add", "--", "README.md", "public_allowlist.json")
+        self.git("commit", "-m", "Synthetic public identity fixture")
+        self.assertEqual(scanner.audit(self.root, require_clean=True)["status"], "PASS")
+
+    def test_github_service_exception_requires_exact_committer_header(self):
+        service = "noreply" + "@github.com"
+        neutral = "maintainers@users.noreply.github.com"
+        data = self.commit_fixture(neutral, committer_email=service, committer_name="GitHub")
+        self.assertEqual(scanner.scan_commit(data, "commit:fixture"), [])
+        cases = [
+            self.commit_fixture(service, author_name="GitHub"),
+            self.commit_fixture(neutral, committer_email=service),
+            self.commit_fixture(neutral, message=service),
+        ]
+        for data in cases:
+            self.assertIn("email_address", [x["rule"] for x in scanner.scan_commit(data, "commit:fixture")])
+        self.assertIn("email_address", [x["rule"] for x in scanner.scan_text(service.encode(), "blob")])
+
+    def test_commit_exception_does_not_cover_messages_names_or_other_headers(self):
+        email = "synthetic-public" + "@users.noreply.github.com"
+        cases = [
+            self.commit_fixture(email, message=email),
+            self.commit_fixture(email, message=f"author Synthetic <{email}> 1700000000 +0000"),
+            self.commit_fixture(email, author_name=email),
+            self.commit_fixture(email, extra_headers="x-contact " + email + "\n"),
+            self.commit_fixture(email, extra_headers=f"gpgsig synthetic\n author Synthetic <{email}> 1700000000 +0000\n"),
+        ]
+        for index, data in enumerate(cases):
+            with self.subTest(location_index=index):
+                findings = scanner.scan_commit(data, "commit:fixture")
+                self.assertEqual([x["rule"] for x in findings], ["email_address"])
+                self.assertNotIn(email, json.dumps(findings))
+        path_result = scanner.scan_text(b"\x00", email + ".md")
+        self.assertEqual(path_result[0]["file"], "[redacted-path]")
+
+    def test_commit_exception_rejects_private_emails_and_malformed_aliases(self):
+        domain = "@users.noreply.github.com"
+        addresses = [
+            "operator" + "@private.invalid", "bad_name" + domain,
+            "-leading" + domain, "trailing-" + domain, "double--dash" + domain,
+            "x" * 40 + domain, "non-numeric+synthetic" + domain,
+            "synthetic" + domain + ".spoof.invalid", "synthetic" + "@github.com",
+        ]
+        for index, email in enumerate(addresses):
+            with self.subTest(alias_index=index):
+                findings = scanner.scan_commit(self.commit_fixture(email), "commit:fixture")
+                self.assertIn("email_address", [x["rule"] for x in findings])
+                self.assertNotIn(email, json.dumps(findings))
+        email = "synthetic-public" + domain
+        data = self.commit_fixture(email).replace(b"1700000000 +0000", b"invalid-time")
+        self.assertIn("email_address", [x["rule"] for x in scanner.scan_commit(data, "commit:fixture")])
+
+    def test_commit_exception_preserves_secret_and_private_vocabulary_checks(self):
+        username = "sk-" + "X" * 24
+        email = username + "@users.noreply.github.com"
+        findings = scanner.scan_commit(self.commit_fixture(email), "commit:fixture")
+        self.assertIn("provider_credential", [x["rule"] for x in findings])
+        self.assertNotIn(username, json.dumps(findings))
+        email = "synthetic-private-client" + "@users.noreply.github.com"
+        for term in ("synthetic-private-client", "synthetic author"):
+            findings = scanner.scan_commit(self.commit_fixture(email), "commit:fixture", (term,))
+            self.assertIn("private_vocabulary", [x["rule"] for x in findings])
+            self.assertNotIn(email, json.dumps(findings))
+        self.git("config", "user.email", email)
+        self.git("add", "--", "README.md", "public_allowlist.json")
+        self.git("commit", "-m", "Synthetic public identity fixture")
+        private = Path(self.temp.name) / "rules.json"
+        private.write_text(json.dumps({"terms": ["synthetic-private-client"]}))
+        result = scanner.audit(self.root, private, require_clean=True)
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertIn("private_vocabulary", [x["rule"] for x in result["issues"]])
 
     def test_unlisted_file_is_blocked_even_if_ignored(self):
         (self.root / "hidden.bin").write_bytes(b"\x00")
